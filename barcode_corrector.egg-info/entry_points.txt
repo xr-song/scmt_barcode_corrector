@@ -1,0 +1,2 @@
+[console_scripts]
+correct-barcodes = barcode_corrector.cli:main

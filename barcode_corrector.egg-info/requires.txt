@@ -1,0 +1,3 @@
+
+[zstandard]
+zstandard>=0.14.0
