@@ -106,7 +106,7 @@ def main():
             output_path_tmp = output_path
 
         with open(output_path_tmp, 'w') as out_fh:
-            corrector.process_fastq(args.input_fastq, out_fh)
+            corrector.process_fastq(args.input_fastq, out_fh, num_threads=args.threads)
 
         if use_gzip:
             with open(output_path_tmp, 'rb') as f_in:
