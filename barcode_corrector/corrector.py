@@ -1,4 +1,8 @@
 from typing import TextIO, Dict, Tuple, Iterator, List
+import gzip
+import os
+import shutil
+
 from collections import defaultdict
 from multiprocessing import Pool
 
@@ -90,12 +94,77 @@ def _match_barcode(bc: str, whitelist_set: set, max_mismatches: int, quality: st
     return min(hits_2, key=lambda h: ord(quality[h[1]]) + ord(quality[h[2]]))[0], 2
 
 
+def _read_chunks(fh, chunk_size: int) -> Iterator[List[Tuple[str, str, str]]]:
+    """Lazy FASTQ iterator: yields fixed-size record lists."""
+    chunk = []
+    while True:
+        name_line = fh.readline()
+        if not name_line:
+            if chunk:
+                yield chunk
+            break
+        seq_line  = fh.readline().strip()
+        fh.readline()  # + separator
+        qual_line = fh.readline().strip()
+        chunk.append((name_line.strip().lstrip('@'), seq_line, qual_line))
+        if len(chunk) == chunk_size:
+            yield chunk
+            chunk = []
+
+
+def _split_fastq(input_fastq: str, n_parts: int, tmp_dir: str) -> List[str]:
+    """
+    Split input_fastq into n_parts sequential gzipped chunk files under tmp_dir.
+    First pass counts total records; second pass writes equal-sized blocks so
+    that concatenating chunk outputs in order reproduces the original read order.
+    Returns list of paths for non-empty chunks.
+    """
+    # Count records (4 lines each) with a fast line count
+    n_records = 0
+    with open_file(input_fastq) as fh:
+        for _ in fh:
+            n_records += 1
+    n_records //= 4
+
+    records_per_chunk = max(1, -(-n_records // n_parts))  # ceiling division
+
+    chunk_paths = []
+    chunk_idx   = 0
+    written     = 0
+    out_fh      = None
+
+    with open_file(input_fastq) as fh:
+        while True:
+            name = fh.readline()
+            if not name:
+                break
+            seq  = fh.readline()
+            plus = fh.readline()
+            qual = fh.readline()
+
+            if written == 0 or written >= records_per_chunk:
+                if out_fh:
+                    out_fh.close()
+                path = os.path.join(tmp_dir, f'chunk_{chunk_idx:04d}.fq.gz')
+                chunk_paths.append(path)
+                out_fh = gzip.open(path, 'wt')
+                chunk_idx += 1
+                written = 0
+
+            out_fh.write(name)
+            out_fh.write(seq)
+            out_fh.write(plus)
+            out_fh.write(qual)
+            written += 1
+
+    if out_fh:
+        out_fh.close()
+
+    return [p for p in chunk_paths if os.path.getsize(p) > 30]
+
+
 def _process_chunk(records: List[Tuple[str, str, str]]) -> Tuple[List[str], Dict]:
-    """
-    Process a list of (read_name, seq, qual) records.
-    Uses per-worker globals set by _worker_init — no large data is re-pickled
-    per task when called from a Pool worker.
-    """
+    """Process a list of (read_name, seq, qual) records using per-worker globals."""
     output_lines = []
     stats = {
         'total_reads': 0,
@@ -114,15 +183,12 @@ def _process_chunk(records: List[Tuple[str, str, str]]) -> Tuple[List[str], Dict
         right_16_qual  = qual_no_sep[-16:]
 
         bc_for_matching = right_16_bases[::-1].translate(_RC_TABLE).upper()
-        # Reverse quality to align coordinate space with bc_for_matching:
-        # bc_for_matching[i] is the RC of right_16_bases[15-i], so its
-        # quality is right_16_qual[15-i] = right_16_qual[::-1][i].
-        bc_qual = right_16_qual[::-1]
+        bc_qual = right_16_qual[::-1]  # aligned with bc_for_matching position-wise
 
         matched_bc, num_mismatches = _match_barcode(bc_for_matching, _wl, _max_mm, bc_qual)
 
         cr_tag = bc_for_matching
-        cy_tag = bc_qual  # CY:Z tag carries quality in same order as CR:Z barcode
+        cy_tag = bc_qual
 
         if matched_bc is not None:
             stats['reads_with_correctable_bc'] += 1
@@ -137,25 +203,30 @@ def _process_chunk(records: List[Tuple[str, str, str]]) -> Tuple[List[str], Dict
     return output_lines, stats
 
 
-def _read_chunks(fh, chunk_size: int) -> Iterator[List[Tuple[str, str, str]]]:
+def _worker_process_chunk_file(args: Tuple[str, str]) -> Dict:
     """
-    Lazy FASTQ iterator: yields fixed-size record lists without holding the
-    full file in memory. Each yielded list is at most `chunk_size` records.
+    Worker entry point for parallel mode.
+    Reads chunk_path (gzipped FASTQ), processes every record using the
+    per-worker globals loaded by _worker_init, writes text to out_path.
+    Returns aggregated stats dict (no record data crosses process boundaries).
     """
-    chunk = []
-    while True:
-        name_line = fh.readline()
-        if not name_line:
-            if chunk:
-                yield chunk
-            break
-        seq_line  = fh.readline().strip()
-        fh.readline()  # + separator line
-        qual_line = fh.readline().strip()
-        chunk.append((name_line.strip().lstrip('@'), seq_line, qual_line))
-        if len(chunk) == chunk_size:
-            yield chunk
-            chunk = []
+    chunk_path, out_path = args
+    stats = {
+        'total_reads': 0,
+        'reads_with_correctable_bc': 0,
+        'reads_with_remapped_bc': 0,
+        'mismatch_distribution': defaultdict(int),
+    }
+    with open_file(chunk_path) as fh, open(out_path, 'w') as out_fh:
+        for chunk in _read_chunks(fh, 50_000):
+            lines, chunk_stats = _process_chunk(chunk)
+            out_fh.writelines(lines)
+            stats['total_reads']               += chunk_stats['total_reads']
+            stats['reads_with_correctable_bc'] += chunk_stats['reads_with_correctable_bc']
+            stats['reads_with_remapped_bc']    += chunk_stats['reads_with_remapped_bc']
+            for mm, cnt in chunk_stats['mismatch_distribution'].items():
+                stats['mismatch_distribution'][mm] += cnt
+    return stats
 
 
 class BarcodeCorrector:
@@ -210,43 +281,63 @@ class BarcodeCorrector:
         chunk_size: int = 50_000,
     ) -> None:
         """
-        Stream-process input_fastq in chunks of `chunk_size` reads.
-
-        num_threads == 1: single-threaded streaming loop, zero IPC overhead.
-        num_threads  > 1: Pool of workers, each pre-loaded with the whitelist
-                          via initializer (whitelist is NOT re-pickled per task).
-                          Memory is bounded to num_threads × chunk_size records.
+        num_threads == 1: single-threaded streaming, zero overhead.
+        num_threads  > 1:
+          1. Split input FASTQ round-robin into num_threads gzipped chunk
+             files in a .bc_tmp/ dir next to the output file.
+          2. Run one worker process per chunk — each reads its own file from
+             disk and writes its own output file. Zero per-task IPC overhead.
+          3. Concatenate output files in order, then delete .bc_tmp/.
         """
-        def _collect(output_lines, chunk_stats):
-            for line in output_lines:
-                output_file.write(line)
-            self.total_reads                += chunk_stats['total_reads']
-            self.reads_with_correctable_bc  += chunk_stats['reads_with_correctable_bc']
-            self.reads_with_remapped_bc     += chunk_stats['reads_with_remapped_bc']
-            for mm, cnt in chunk_stats['mismatch_distribution'].items():
-                self.mismatch_distribution[mm] += cnt
-
-        # Set worker globals in the main process for the single-threaded path.
+        # Set globals for the single-threaded path (workers do it via initializer)
         _worker_init(self.whitelist_barcodes, self.remapping_dict,
                      self.max_mismatches, self.barcode_suffix)
 
-        with open_file(input_fastq) as fh:
-            if num_threads == 1:
+        def _accumulate(s: Dict) -> None:
+            self.total_reads               += s['total_reads']
+            self.reads_with_correctable_bc += s['reads_with_correctable_bc']
+            self.reads_with_remapped_bc    += s['reads_with_remapped_bc']
+            for mm, cnt in s['mismatch_distribution'].items():
+                self.mismatch_distribution[mm] += cnt
+
+        if num_threads == 1:
+            with open_file(input_fastq) as fh:
                 for chunk in _read_chunks(fh, chunk_size):
-                    _collect(*_process_chunk(chunk))
-            else:
-                with Pool(
-                    processes=num_threads,
-                    initializer=_worker_init,
-                    initargs=(self.whitelist_barcodes, self.remapping_dict,
-                              self.max_mismatches, self.barcode_suffix),
-                ) as pool:
-                    # imap preserves output order; chunksize=1 because each item
-                    # is already a large chunk — don't batch further.
-                    for result in pool.imap(_process_chunk,
-                                            _read_chunks(fh, chunk_size),
-                                            chunksize=1):
-                        _collect(*result)
+                    lines, stats = _process_chunk(chunk)
+                    output_file.writelines(lines)
+                    _accumulate(stats)
+            return
+
+        # Derive tmp dir from the output file path
+        out_name = getattr(output_file, 'name', None)
+        if out_name and out_name not in ('<stdout>', '<stderr>'):
+            tmp_dir = os.path.join(os.path.dirname(os.path.abspath(out_name)), '.bc_tmp')
+        else:
+            tmp_dir = os.path.join(os.path.dirname(os.path.abspath(input_fastq)), '.bc_tmp')
+
+        os.makedirs(tmp_dir, exist_ok=True)
+        try:
+            # Step 1: split
+            chunk_paths = _split_fastq(input_fastq, num_threads, tmp_dir)
+            out_paths   = [os.path.join(tmp_dir, f'out_{i:04d}.txt') for i in range(len(chunk_paths))]
+
+            # Step 2: process chunks in parallel — workers only pass back small stats dicts
+            with Pool(
+                processes=len(chunk_paths),
+                initializer=_worker_init,
+                initargs=(self.whitelist_barcodes, self.remapping_dict,
+                          self.max_mismatches, self.barcode_suffix),
+            ) as pool:
+                all_stats = pool.map(_worker_process_chunk_file, zip(chunk_paths, out_paths))
+
+            # Step 3: concatenate output files in order and accumulate stats
+            for out_path, stats in zip(out_paths, all_stats):
+                with open(out_path) as fh:
+                    shutil.copyfileobj(fh, output_file)
+                _accumulate(stats)
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def get_statistics(self) -> Dict:
         frac_corrected = (
