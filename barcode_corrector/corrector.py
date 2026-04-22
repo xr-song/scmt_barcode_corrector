@@ -1,78 +1,66 @@
-import gzip
-from pathlib import Path
-from typing import TextIO, Dict, Tuple, List
+from typing import TextIO, Dict, Tuple
 from collections import defaultdict
-from multiprocessing import Pool
-from functools import partial
 
 from .loader import open_file, load_barcode_whitelist, load_barcode_remapping
 from .matcher import find_closest_barcode, remap_barcode
 
+# Translation table for reverse complement — faster than dict lookup per base
+_RC_TABLE = str.maketrans('ACGTNacgtn', 'TGCANtgcan')
+_BASES = 'ACGT'
 
-def _process_record_batch(batch_records: List[Tuple], 
-                          whitelist_barcodes: set, 
-                          remapping_dict: dict, 
-                          max_mismatches: int,
-                          barcode_suffix: str) -> Tuple[List[str], Dict]:
-    
-    output_lines = []
-    stats = {
-        'total_reads': 0,
-        'reads_with_correctable_bc': 0,
-        'reads_with_remapped_bc': 0,
-        'mismatch_distribution': defaultdict(int)
-    }
-    
-    complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
-    
-    for read_name, sequence_line, quality_line in batch_records:
-        raw_bc = sequence_line
-        raw_bc_qual = quality_line
-        stats['total_reads'] += 1
-        
-        seq_no_sep = raw_bc[1:] if raw_bc.startswith('N') else raw_bc
-        qual_no_sep = raw_bc_qual[1:] if len(raw_bc_qual) == len(raw_bc) and raw_bc.startswith('N') else raw_bc_qual
-        
-        right_16_bases = seq_no_sep[-16:] if len(seq_no_sep) >= 16 else seq_no_sep
-        right_16_qual = qual_no_sep[-16:] if len(qual_no_sep) >= 16 else qual_no_sep
-        
-        bc_for_matching = ''.join(complement.get(base, 'N') for base in reversed(right_16_bases.upper()))
-        
-        closest_barcode = None
-        min_distance = max_mismatches + 1
-        best_quality_score = -1
-        
-        for whitelist_bc in whitelist_barcodes:
-            distance = sum(c1 != c2 for c1, c2 in zip(bc_for_matching, whitelist_bc))
-            if distance <= max_mismatches:
-                if len(right_16_qual) == len(bc_for_matching):
-                    quality_score = sum(ord(right_16_qual[i]) for i, (raw_base, ref_base) in enumerate(zip(bc_for_matching, whitelist_bc)) if raw_base != ref_base)
-                    if distance < min_distance or (distance == min_distance and quality_score < best_quality_score):
-                        closest_barcode = whitelist_bc
-                        min_distance = distance
-                        best_quality_score = quality_score
-                else:
-                    if distance < min_distance:
-                        closest_barcode = whitelist_bc
-                        min_distance = distance
-        
-        cr_tag = bc_for_matching
-        cy_tag = right_16_qual[::-1]
-        
-        if closest_barcode is not None:
-            stats['reads_with_correctable_bc'] += 1
-            stats['mismatch_distribution'][min_distance] += 1
-            
-            remapped_barcode = remapping_dict.get(closest_barcode, closest_barcode)
-            if remapped_barcode != closest_barcode:
-                stats['reads_with_remapped_bc'] += 1
-            
-            corrected_bc_with_suffix = f"{remapped_barcode}-{barcode_suffix}"
-            output_lines.append(f"{read_name} CR:Z:{cr_tag}\tCY:Z:{cy_tag}\tCB:Z:{corrected_bc_with_suffix}\n")
-        else:
-            output_lines.append(f"{read_name} CR:Z:{cr_tag}\tCY:Z:{cy_tag}\n")
-    
-    return output_lines, stats
+
+def _match_barcode(bc: str, whitelist_set: set, max_mismatches: int, quality: str):
+    """
+    Match bc against whitelist using set membership — O(1) exact, O(48) for
+    1-mismatch, O(1080) for 2-mismatches — instead of O(737K) linear scan.
+
+    Returns (matched_barcode, num_mismatches) or (None, None).
+    """
+    # Exact match
+    if bc in whitelist_set:
+        return bc, 0
+
+    if max_mismatches < 1:
+        return None, None
+
+    # 1-mismatch: generate all 16×3 = 48 variants and probe the set
+    hits_1 = []
+    for i in range(len(bc)):
+        orig = bc[i]
+        for base in _BASES:
+            if base != orig:
+                variant = bc[:i] + base + bc[i+1:]
+                if variant in whitelist_set:
+                    hits_1.append((variant, i))
+
+    if hits_1:
+        if len(hits_1) == 1 or not quality or len(quality) != len(bc):
+            return hits_1[0][0], 1
+        # Tiebreak: prefer lower quality score at mismatch position (less confident base)
+        return min(hits_1, key=lambda h: ord(quality[h[1]]))[0], 1
+
+    if max_mismatches < 2:
+        return None, None
+
+    # 2-mismatch: C(16,2)×9 = 1080 variants
+    hits_2 = []
+    for i in range(len(bc)):
+        for j in range(i + 1, len(bc)):
+            for b1 in _BASES:
+                if b1 == bc[i]:
+                    continue
+                for b2 in _BASES:
+                    if b2 == bc[j]:
+                        continue
+                    variant = bc[:i] + b1 + bc[i+1:j] + b2 + bc[j+1:]
+                    if variant in whitelist_set:
+                        hits_2.append((variant, i, j))
+
+    if not hits_2:
+        return None, None
+    if len(hits_2) == 1 or not quality or len(quality) != len(bc):
+        return hits_2[0][0], 2
+    return min(hits_2, key=lambda h: ord(quality[h[1]]) + ord(quality[h[2]]))[0], 2
 
 
 class BarcodeCorrector:
@@ -124,49 +112,54 @@ class BarcodeCorrector:
         self,
         input_fastq: str,
         output_file: TextIO,
-        num_threads: int = 4
+        num_threads: int = 1
     ) -> None:
-        
-        fastq_records = []
+        whitelist_barcodes = self.whitelist_barcodes
+        remapping_dict = self.remapping_dict
+        max_mismatches = self.max_mismatches
+        barcode_suffix = self.barcode_suffix
+
         with open_file(input_fastq) as fh:
             while True:
-                read_name_line = fh.readline().strip()
-                if not read_name_line:
+                name_line = fh.readline()
+                if not name_line:
                     break
-                
-                sequence_line = fh.readline().strip()
-                plus_line = fh.readline().strip()
-                quality_line = fh.readline().strip()
-                
-                read_name = read_name_line[1:] if read_name_line.startswith('@') else read_name_line
-                fastq_records.append((read_name, sequence_line, quality_line))
-        
-        if not fastq_records:
-            return
-        
-        chunk_size = max(1, len(fastq_records) // num_threads)
-        chunks = [fastq_records[i:i + chunk_size] for i in range(0, len(fastq_records), chunk_size)]
-        
-        process_func = partial(
-            _process_record_batch,
-            whitelist_barcodes=self.whitelist_barcodes,
-            remapping_dict=self.remapping_dict,
-            max_mismatches=self.max_mismatches,
-            barcode_suffix=self.barcode_suffix
-        )
-        
-        with Pool(processes=num_threads) as pool:
-            results = pool.map(process_func, chunks)
-        
-        for output_lines, chunk_stats in results:
-            for line in output_lines:
-                output_file.write(line)
-            
-            self.total_reads += chunk_stats['total_reads']
-            self.reads_with_correctable_bc += chunk_stats['reads_with_correctable_bc']
-            self.reads_with_remapped_bc += chunk_stats['reads_with_remapped_bc']
-            for mismatches, count in chunk_stats['mismatch_distribution'].items():
-                self.mismatch_distribution[mismatches] += count
+
+                seq_line  = fh.readline().strip()
+                fh.readline()                          # + separator
+                qual_line = fh.readline().strip()
+
+                read_name = name_line.strip()
+                if read_name.startswith('@'):
+                    read_name = read_name[1:]
+
+                self.total_reads += 1
+
+                seq_no_sep  = seq_line[1:]  if seq_line.startswith('N')  else seq_line
+                qual_no_sep = qual_line[1:] if len(qual_line) == len(seq_line) and seq_line.startswith('N') else qual_line
+
+                right_16_bases = seq_no_sep[-16:]
+                right_16_qual  = qual_no_sep[-16:]
+
+                # Reverse complement via fast translate table, no per-base dict lookup
+                bc_for_matching = right_16_bases[::-1].translate(_RC_TABLE).upper()
+
+                matched_bc, num_mismatches = _match_barcode(
+                    bc_for_matching, whitelist_barcodes, max_mismatches, right_16_qual
+                )
+
+                cr_tag = bc_for_matching
+                cy_tag = right_16_qual[::-1]
+
+                if matched_bc is not None:
+                    self.reads_with_correctable_bc += 1
+                    self.mismatch_distribution[num_mismatches] += 1
+                    remapped = remapping_dict.get(matched_bc, matched_bc)
+                    if remapped != matched_bc:
+                        self.reads_with_remapped_bc += 1
+                    output_file.write(f"{read_name} CR:Z:{cr_tag}\tCY:Z:{cy_tag}\tCB:Z:{remapped}-{barcode_suffix}\n")
+                else:
+                    output_file.write(f"{read_name} CR:Z:{cr_tag}\tCY:Z:{cy_tag}\n")
 
     def get_statistics(self) -> Dict:
         frac_corrected = (
