@@ -1,7 +1,8 @@
 from typing import TextIO, Dict, Tuple, Iterator, List
-import gzip
 import os
+import shlex
 import shutil
+import subprocess
 
 from collections import defaultdict
 from multiprocessing import Pool
@@ -114,53 +115,41 @@ def _read_chunks(fh, chunk_size: int) -> Iterator[List[Tuple[str, str, str]]]:
 
 def _split_fastq(input_fastq: str, n_parts: int, tmp_dir: str) -> List[str]:
     """
-    Split input_fastq into n_parts sequential gzipped chunk files under tmp_dir.
-    First pass counts total records; second pass writes equal-sized blocks so
-    that concatenating chunk outputs in order reproduces the original read order.
-    Returns list of paths for non-empty chunks.
+    Split input_fastq into n_parts plain-text chunk files using shell tools.
+
+    Two fast single-pass shell commands — no Python gzip overhead:
+      1. zcat | wc -l   → count total lines
+      2. zcat | split   → write sequential plain-text chunks
+
+    Returns sorted list of chunk file paths (may be fewer than n_parts if the
+    file has fewer than n_parts records).
     """
-    # Count records (4 lines each) with a fast line count
-    n_records = 0
-    with open_file(input_fastq) as fh:
-        for _ in fh:
-            n_records += 1
-    n_records //= 4
+    decompress = 'zcat' if input_fastq.endswith('.gz') else 'cat'
 
-    records_per_chunk = max(1, -(-n_records // n_parts))  # ceiling division
+    # Step 1: count total lines (single decompression pass, C speed)
+    wc = subprocess.run(
+        f'{decompress} {shlex.quote(input_fastq)} | wc -l',
+        shell=True, capture_output=True, text=True, check=True
+    )
+    total_lines = int(wc.stdout.strip())
+    total_records = total_lines // 4
 
-    chunk_paths = []
-    chunk_idx   = 0
-    written     = 0
-    out_fh      = None
+    # lines_per_chunk must be a multiple of 4 (one FASTQ record = 4 lines)
+    records_per_chunk = max(1, -(-total_records // n_parts))  # ceiling division
+    lines_per_chunk   = records_per_chunk * 4
 
-    with open_file(input_fastq) as fh:
-        while True:
-            name = fh.readline()
-            if not name:
-                break
-            seq  = fh.readline()
-            plus = fh.readline()
-            qual = fh.readline()
+    # Step 2: decompress and split (single decompression pass, C speed)
+    # chunk files: chunk_0000, chunk_0001, … (plain text)
+    prefix = os.path.join(tmp_dir, 'chunk_')
+    subprocess.run(
+        f'{decompress} {shlex.quote(input_fastq)} | '
+        f'split -l {lines_per_chunk} --numeric-suffixes=0 --suffix-length=4 - {shlex.quote(prefix)}',
+        shell=True, check=True
+    )
 
-            if written == 0 or written >= records_per_chunk:
-                if out_fh:
-                    out_fh.close()
-                path = os.path.join(tmp_dir, f'chunk_{chunk_idx:04d}.fq.gz')
-                chunk_paths.append(path)
-                out_fh = gzip.open(path, 'wt')
-                chunk_idx += 1
-                written = 0
-
-            out_fh.write(name)
-            out_fh.write(seq)
-            out_fh.write(plus)
-            out_fh.write(qual)
-            written += 1
-
-    if out_fh:
-        out_fh.close()
-
-    return [p for p in chunk_paths if os.path.getsize(p) > 30]
+    return sorted(
+        os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.startswith('chunk_')
+    )
 
 
 def _process_chunk(records: List[Tuple[str, str, str]]) -> Tuple[List[str], Dict]:
@@ -217,7 +206,7 @@ def _worker_process_chunk_file(args: Tuple[str, str]) -> Dict:
         'reads_with_remapped_bc': 0,
         'mismatch_distribution': defaultdict(int),
     }
-    with open_file(chunk_path) as fh, open(out_path, 'w') as out_fh:
+    with open(chunk_path) as fh, open(out_path, 'w') as out_fh:
         for chunk in _read_chunks(fh, 50_000):
             lines, chunk_stats = _process_chunk(chunk)
             out_fh.writelines(lines)
