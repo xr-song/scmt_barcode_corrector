@@ -10,12 +10,9 @@ from multiprocessing import Pool
 from .loader import open_file, load_barcode_whitelist, load_barcode_remapping
 from .matcher import find_closest_barcode, remap_barcode
 
-# Translation table for reverse complement — faster than dict lookup per base
 _RC_TABLE = str.maketrans('ACGTNacgtn', 'TGCANtgcan')
 _BASES = 'ACGT'
 
-# Per-worker process globals — set once at worker startup via Pool initializer,
-# avoiding re-pickling the large whitelist set on every task.
 _wl: set = None
 _remap: dict = None
 _max_mm: int = None
@@ -40,12 +37,9 @@ def _match_barcode(bc: str, whitelist_set: set, max_mismatches: int, quality: st
     to position i in bc.
 
     Tie handling:
-      - Single hit: returned immediately.
       - Multiple hits at equal distance: prefer the candidate whose mismatch
         falls at the position with the LOWEST quality score in the read
         (low Phred = low confidence = most likely a sequencing error there).
-      - If quality is absent or mismatched in length: first hit is returned
-        (non-deterministic across runs due to set ordering).
 
     Returns (matched_barcode, num_mismatches) or (None, None).
     """
@@ -116,17 +110,9 @@ def _read_chunks(fh, chunk_size: int) -> Iterator[List[Tuple[str, str, str]]]:
 def _split_fastq(input_fastq: str, n_parts: int, tmp_dir: str) -> List[str]:
     """
     Split input_fastq into n_parts plain-text chunk files using shell tools.
-
-    Two fast single-pass shell commands — no Python gzip overhead:
-      1. zcat | wc -l   → count total lines
-      2. zcat | split   → write sequential plain-text chunks
-
-    Returns sorted list of chunk file paths (may be fewer than n_parts if the
-    file has fewer than n_parts records).
     """
     decompress = 'zcat' if input_fastq.endswith('.gz') else 'cat'
 
-    # Step 1: count total lines (single decompression pass, C speed)
     wc = subprocess.run(
         f'{decompress} {shlex.quote(input_fastq)} | wc -l',
         shell=True, capture_output=True, text=True, check=True
@@ -134,12 +120,8 @@ def _split_fastq(input_fastq: str, n_parts: int, tmp_dir: str) -> List[str]:
     total_lines = int(wc.stdout.strip())
     total_records = total_lines // 4
 
-    # lines_per_chunk must be a multiple of 4 (one FASTQ record = 4 lines)
     records_per_chunk = max(1, -(-total_records // n_parts))  # ceiling division
     lines_per_chunk   = records_per_chunk * 4
-
-    # Step 2: decompress and split (single decompression pass, C speed)
-    # chunk files: chunk_0000, chunk_0001, … (plain text)
     prefix = os.path.join(tmp_dir, 'chunk_')
     subprocess.run(
         f'{decompress} {shlex.quote(input_fastq)} | '
@@ -278,7 +260,6 @@ class BarcodeCorrector:
              disk and writes its own output file. Zero per-task IPC overhead.
           3. Concatenate output files in order, then delete .bc_tmp/.
         """
-        # Set globals for the single-threaded path (workers do it via initializer)
         _worker_init(self.whitelist_barcodes, self.remapping_dict,
                      self.max_mismatches, self.barcode_suffix)
 
@@ -297,7 +278,6 @@ class BarcodeCorrector:
                     _accumulate(stats)
             return
 
-        # Derive tmp dir from the output file path
         out_name = getattr(output_file, 'name', None)
         if out_name and out_name not in ('<stdout>', '<stderr>'):
             tmp_dir = os.path.join(os.path.dirname(os.path.abspath(out_name)), '.bc_tmp')
@@ -306,11 +286,9 @@ class BarcodeCorrector:
 
         os.makedirs(tmp_dir, exist_ok=True)
         try:
-            # Step 1: split
             chunk_paths = _split_fastq(input_fastq, num_threads, tmp_dir)
             out_paths   = [os.path.join(tmp_dir, f'out_{i:04d}.txt') for i in range(len(chunk_paths))]
 
-            # Step 2: process chunks in parallel — workers only pass back small stats dicts
             with Pool(
                 processes=len(chunk_paths),
                 initializer=_worker_init,
@@ -319,7 +297,6 @@ class BarcodeCorrector:
             ) as pool:
                 all_stats = pool.map(_worker_process_chunk_file, zip(chunk_paths, out_paths))
 
-            # Step 3: concatenate output files in order and accumulate stats
             for out_path, stats in zip(out_paths, all_stats):
                 with open(out_path) as fh:
                     shutil.copyfileobj(fh, output_file)

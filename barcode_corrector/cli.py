@@ -14,12 +14,12 @@ def main():
 
     parser.add_argument(
         'dna_whitelist_file',
-        help='DNA barcode whitelist file (one barcode per line)'
+        help='DNA barcode whitelist file'
     )
 
     parser.add_argument(
         'rna_whitelist_file',
-        help='RNA barcode whitelist file for remapping. Use "false" or "none" to disable.'
+        help='RNA barcode whitelist file'
     )
 
     parser.add_argument(
@@ -60,8 +60,8 @@ def main():
     parser.add_argument(
         '--threads',
         type=int,
-        default=4,
-        help='Number of threads to use for compression (default: 4)'
+        default=1,
+        help='Number of threads to use for compression (default: 1)'
     )
 
     args = parser.parse_args()
