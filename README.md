@@ -1,8 +1,8 @@
-# barcode-corrector
+# barcode-extractor
 
 Efficient Python implementation of barcode correction for in-house single-cell genomics FASTQ files.
 
-## Barcode Correction Logic
+## Barcode correction logic
 
 The barcode corrector processes FASTQ files containing raw barcode sequences from single-cell genomics experiments:
 
@@ -59,7 +59,7 @@ correct-barcodes \
 - `--stats-file`: Statistics output file
 - `--threads`: CPUs to use (default: 1)
 
-## Output Format
+## Output format
 
 Tab-separated columns:
 1. read_name

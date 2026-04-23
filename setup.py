@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="barcode-corrector",
+    name="barcode-extractor",
     version="1.0.0",
-    description="Efficient barcode correction for single-cell genomics",
+    description="Efficient barcode extraction for single-cell omics",
     packages=find_packages(),
     python_requires=">=3.7",
     install_requires=[],
@@ -12,7 +12,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'correct-barcodes=barcode_corrector.cli:main',
+            'extract-barcodes=barcode_extractor.cli:main',
         ],
     },
 )

@@ -92,7 +92,7 @@ def main():
             barcode_suffix=args.barcode_suffix
         )
 
-        print("Starting barcode correction...")
+        print("Starting barcode extraction...")
 
         output_path = args.output_file
         use_gzip = output_path.endswith('.gz')
