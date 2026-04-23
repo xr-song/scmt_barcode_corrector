@@ -1,8 +1,6 @@
 # barcode-corrector
 
-Efficient Python implementation of barcode correction for single-cell genomics FASTQ files.
-
-Translates the functionality of `correct_barcode_from_fastq.sh` from the original single_cell_toolkit into pure Python with improved variable naming and efficiency.
+Efficient Python implementation of barcode correction for in-house single-cell genomics FASTQ files.
 
 ## Barcode Correction Logic
 
@@ -10,26 +8,23 @@ The barcode corrector processes FASTQ files containing raw barcode sequences fro
 
 ```mermaid
 flowchart TD
-    A["read fastq record"] --> B["extract sequence and quality"]
-    B --> C["skip leading separator"]
-    C --> D["extract last 16 bases"]
-    D --> E["reverse complement"]
-    E --> F["find closest match in dna whitelist"]
+    A["read fastq record"] --> B["extract sequence\n& quality"]
+    B --> D["extract last 16 bases\n& reverse complement"]
+    D --> F["find closest match in DNA whitelist"]
     F --> G{"match found?"}
-    G -->|yes| H["remap to rna whitelist"]
+    G -->|yes| H["map to RNA whitelist"]
     G -->|no| I["keep raw barcode"]
-    H --> J["output: cr:z, cy:z, cb:z tags"]
-    I --> K["output: cr:z, cy:z tags"]
-    J --> L["record statistics"]
+    H --> J["output: CR:Z, CY:Z, CB:Z tags"]
+    I --> K["output: CR:Z, CY:Z tags"]
+    J --> L["write barcode detection stat"]
     K --> L
 ```
 
-## Quick Start
+## Installation
 
 ```bash
+git clone <this repo>
 pip install -e .
-
-correct-barcodes dna_whitelist.txt.gz rna_whitelist.txt.gz input.fastq.gz output.tsv --stats-file stats.tsv
 ```
 
 ## Usage
@@ -48,7 +43,8 @@ correct-barcodes \
     corrected_barcodes.tsv \
     --barcode-suffix 1 \
     --max-mismatches 1 \
-    --stats-file correction_stats.tsv
+    --stats-file correction_stats.tsv \
+    --threads 8
 ```
 
 ## Parameters
@@ -61,11 +57,12 @@ correct-barcodes \
 - `--max-mismatches`: Max mismatches (default: 1)
 - `--min-fraction`: Min correctable fraction (default: 0.5)
 - `--stats-file`: Statistics output file
+- `--threads`: CPUs to use (default: 1)
 
 ## Output Format
 
 Tab-separated columns:
 1. read_name
-2. cr:z - raw barcode sequence (reverse complemented)
-3. cy:z - raw barcode quality (reversed to match rc)
-4. cb:z - corrected barcode with suffix (if correctable)
+2. CR:Z - raw barcode sequence (reverse complemented)
+3. CY:Z - raw barcode quality (reversed to match rc)
+4. CB:Z - corrected barcode with suffix (if correctable)
